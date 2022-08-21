@@ -13,6 +13,19 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::expiration::Expiration;
 use crate::msg::{Tx, TxAction};
 
+
+/// prefix for the storage of revoked permits
+pub const PREFIX_CLAIM_LIST: &[u8] = b"claimlist";
+/// prefix for the storage of snip20 address
+pub const CLAIM_SNIP_ADDRESS_KEY: &[u8] = b"claimaddress";
+/// Storage for storing the hash of the snip20 contract
+pub const CLAIM_SNIP_HASH_KEY: &[u8] = b"claimhash";
+/// Tells what the current snip-20 claim number is
+pub const CURRENT_CLAIM: &[u8] = b"currentclaim";
+
+
+
+
 /// storage key for config
 pub const CONFIG_KEY: &[u8] = b"config";
 /// storage key for the BlockInfo when the last handle was executed

@@ -64,6 +64,8 @@ pub struct Extension {
     /// token subtypes used by Stashh for display groupings (primarily used for badges, which are specified
     /// by using "badge" as the token_subtype)
     pub token_subtype: Option<String>,
+    /// Last token claim ID that token was able to claim. Used keep track of dividend payments
+    pub claim_num: u16,
 }
 
 /// attribute trait

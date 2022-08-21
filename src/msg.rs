@@ -2,7 +2,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cosmwasm_std::{Binary, Coin, HumanAddr};
+use cosmwasm_std::{Binary, Coin, HumanAddr, Uint128};
 use secret_toolkit::permit::Permit;
 
 use crate::expiration::Expiration;
@@ -31,6 +31,13 @@ pub struct InitMsg {
     /// contract that instantiated it, but it could be used to execute any
     /// contract
     pub post_init_callback: Option<PostInitCallback>,
+
+
+    /// Stores callback hash for dividend claim token contract
+    pub claim_hash: String,
+    /// Stores snip20 dividend claim token contract address
+    pub claim_address: HumanAddr,
+
 }
 
 /// This type represents optional configuration values.
@@ -102,6 +109,14 @@ pub struct PostInitCallback {
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HandleMsg {
+    /// Receive Snip20 deposit
+    Receive {
+        sender: HumanAddr,
+        from: HumanAddr,
+        amount: Uint128,
+        #[serde(default)]
+        msg: Option<Binary>,
+    },
     /// mint new token
     MintNft {
         /// optional token id. if omitted, use current token index
@@ -480,6 +495,14 @@ pub struct Send {
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum HandleAnswer {
+    /// Allow nft owner to claim share of snip20s
+    ClaimTokens {
+        status: ResponseStatus, 
+    },
+    /// Deposit dividend snip20s into the smart contract
+    ReceiveDeposit {
+        status: ResponseStatus, 
+    },
     /// MintNft will also display the minted token's ID in the log attributes under the
     /// key `minted` in case minting was done as a callback message
     MintNft {

@@ -339,6 +339,7 @@ dependencies = [
  "secret-toolkit-crypto",
  "secret-toolkit-permit",
  "secret-toolkit-serialization",
+ "secret-toolkit-snip20",
  "secret-toolkit-storage",
  "secret-toolkit-utils",
 ]
@@ -377,6 +378,18 @@ dependencies = [
  "bincode2",
  "schemars",
  "secret-cosmwasm-std",
+ "serde",
+]
+
+[[package]]
+name = "secret-toolkit-snip20"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f3f125ba8f44970075d3d6246d715296a223fd055895e136c63f490a4adc472"
+dependencies = [
+ "schemars",
+ "secret-cosmwasm-std",
+ "secret-toolkit-utils",
  "serde",
 ]
 

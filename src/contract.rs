@@ -1,7 +1,7 @@
 use cosmwasm_std::{
     log, to_binary, Api, Binary, BlockInfo, CanonicalAddr, CosmosMsg, Env, Extern, HandleResponse,
     HandleResult, HumanAddr, InitResponse, InitResult, Querier, QueryResult, ReadonlyStorage,
-    StdError, StdResult, Storage, WasmMsg,
+    StdError, StdResult, Storage, Uint128, WasmMsg,
 };
 use cosmwasm_storage::{PrefixedStorage, ReadonlyPrefixedStorage};
 use primitive_types::U256;
@@ -11,10 +11,10 @@ use std::collections::HashSet;
 
 use secret_toolkit::{
     permit::{validate, Permit, RevokedPermits},
+    snip20::transfer_msg,
     utils::{pad_handle_result, pad_query_result},
 };
 
-use crate::expiration::Expiration;
 use crate::inventory::{Inventory, InventoryIter};
 use crate::mint_run::{SerialNumber, StoredMintRunInfo};
 use crate::msg::{
@@ -35,6 +35,10 @@ use crate::state::{
 };
 use crate::token::{Metadata, Token};
 use crate::viewing_key::{ViewingKey, VIEWING_KEY_SIZE};
+use crate::{
+    expiration::Expiration,
+    state::{CLAIM_SNIP_ADDRESS_KEY, CLAIM_SNIP_HASH_KEY, CURRENT_CLAIM, PREFIX_CLAIM_LIST},
+};
 
 /// pad handle responses and log attributes to blocks of 256 bytes to prevent leaking info based on
 /// response size
@@ -96,6 +100,15 @@ pub fn init<S: Storage, A: Api, Q: Querier>(
     // TODO remove this after BlockInfo becomes available to queries
     save(&mut deps.storage, BLOCK_KEY, &env.block)?;
 
+    // save set divident data
+    save(&mut deps.storage, CLAIM_SNIP_HASH_KEY, &msg.claim_hash)?;
+    save(
+        &mut deps.storage,
+        CLAIM_SNIP_ADDRESS_KEY,
+        &msg.claim_address,
+    )?;
+    save(&mut deps.storage, CURRENT_CLAIM, &Uint128(0).u128())?;
+
     if msg.royalty_info.is_some() {
         store_royalties(
             &mut deps.storage,
@@ -142,6 +155,12 @@ pub fn handle<S: Storage, A: Api, Q: Querier>(
     let mut config: Config = load(&deps.storage, CONFIG_KEY)?;
 
     let response = match msg {
+        HandleMsg::Receive {
+            sender,
+            from,
+            amount,
+            msg,
+        } => receive(deps, env, sender, from, amount, msg),
         HandleMsg::MintNft {
             token_id,
             owner,
@@ -446,6 +465,171 @@ pub fn handle<S: Storage, A: Api, Q: Querier>(
         }
     };
     pad_handle_result(response, BLOCK_SIZE)
+}
+
+/// For receiving SNIP20s and minting
+pub fn receive<S: Storage, A: Api, Q: Querier>(
+    deps: &mut Extern<S, A, Q>,
+    env: Env,
+    sender: HumanAddr,
+    _from: HumanAddr,
+    amount: Uint128,
+    _msg: Option<Binary>,
+) -> HandleResult {
+    let mut config: Config = load(&deps.storage, CONFIG_KEY)?;
+
+    deposit_rewards(deps, env, &mut config, sender, amount)
+}
+
+/// Loads snip20 tokens into contract for rewards
+pub fn deposit_rewards<S: Storage, A: Api, Q: Querier>(
+    deps: &mut Extern<S, A, Q>,
+    env: Env,
+    config: &Config,
+    sender: HumanAddr,
+    amount: Uint128,
+) -> HandleResult {
+    let snip20_address: HumanAddr = load(&deps.storage, CLAIM_SNIP_ADDRESS_KEY)?;
+    if env.message.sender != snip20_address {
+        return Err(StdError::generic_err(
+            "Address is not correct snip contract",
+        ));
+    }
+
+    if config.admin != deps.api.canonical_address(&sender)? {
+        return Err(StdError::generic_err(
+            "This function is only usable by the Admin",
+        ));
+    }
+
+    let drop_amount: u128 = amount.u128() / config.token_cnt as u128;
+    let mut current_claim: u16 = load(&deps.storage, CURRENT_CLAIM)?;
+    current_claim = current_claim + 1;
+
+    save(&mut deps.storage, CURRENT_CLAIM, &current_claim)?;
+
+    // Log
+    let claim_number_str = format!("{} ", current_claim);
+    let claim_drop_amount_str = format!("{} ", drop_amount);
+
+    let mut claim_storage = PrefixedStorage::new(PREFIX_CLAIM_LIST, &mut deps.storage);
+
+    save(
+        &mut claim_storage,
+        &current_claim.to_le_bytes(),
+        &drop_amount,
+    )?;
+
+    Ok(HandleResponse {
+        messages: vec![],
+        log: vec![
+            log("Last claim", &claim_number_str),
+            log("Ending claim", &claim_drop_amount_str),
+        ],
+        data: Some(to_binary(&HandleAnswer::ReceiveDeposit {
+            status: Success,
+        })?),
+    })
+}
+
+/// Returns HandleResult
+///
+/// Lets you claim tokens availible for your nft
+///
+/// # Arguments
+///
+/// * `deps` - mutable reference to Extern containing all the contract's external dependencies
+/// * `env` - Env of contract's environment
+/// * `config` - a reference to the Config
+/// * `priority` - u8 representation of highest status level this action is permitted at
+/// * `token_id` - token id String slice of token whose metadata should be updated
+pub fn claim_tokens<S: Storage, A: Api, Q: Querier>(
+    deps: &mut Extern<S, A, Q>,
+    env: Env,
+    config: &Config,
+    priority: u8,
+    token_id: &str,
+) -> HandleResult {
+    check_status(config.status, priority)?;
+    let custom_err = format!("Not authorized to update metadata of token {}", token_id);
+    // if token supply is private, don't leak that the token id does not exist
+    // instead just say they are not authorized for that token
+    let opt_err = if config.token_supply_is_public {
+        None
+    } else {
+        Some(&*custom_err)
+    };
+    let (token, idx) = get_token(&deps.storage, token_id, opt_err)?;
+    let sender_raw = deps.api.canonical_address(&env.message.sender)?;
+    if !(token.owner == sender_raw) {
+        return Err(StdError::generic_err(custom_err));
+    }
+
+    let token_key = idx.to_le_bytes();
+
+    let callback_code_hash: String = load(&deps.storage, CLAIM_SNIP_HASH_KEY)?;
+    let snip20_address: HumanAddr = load(&deps.storage, CLAIM_SNIP_ADDRESS_KEY)?;
+
+    let current_claim: u16 = load(&deps.storage, CURRENT_CLAIM)?;
+
+    let priv_store = ReadonlyPrefixedStorage::new(PREFIX_PRIV_META, &deps.storage);
+    let mut may_priv: Metadata = may_load(&priv_store, &token_key)?.unwrap_or(Metadata {
+        token_uri: None,
+        extension: None,
+    });
+    let mut claim_itr = may_priv.clone().extension.unwrap().claim_num;
+
+    let claim_storage = ReadonlyPrefixedStorage::new(PREFIX_CLAIM_LIST, &deps.storage);
+
+    let mut msg_list: Vec<CosmosMsg> = vec![];
+    let padding = None;
+    let mut total_tokens: u128 = 0;
+
+    //TEST LOG
+    let claim_start_str = format!("{} ", claim_itr);
+    let claim_max_str = format!("{} ", current_claim);
+
+    while claim_itr < current_claim {
+        claim_itr = claim_itr + 1;
+        let amount: u128 = load(&claim_storage, &claim_itr.to_le_bytes())?;
+        total_tokens = total_tokens + amount;
+    }
+
+    // TEST LOG
+    let claim_end_str = format!("{} ", claim_itr);
+    let claim_tokens_str = format!("{} ", total_tokens);
+
+    let recipient = env.message.sender.clone();
+    let cosmos_msg = transfer_msg(
+        recipient,
+        Uint128::from(total_tokens),
+        None,
+        padding.clone(),
+        BLOCK_SIZE,
+        callback_code_hash.clone(),
+        snip20_address.clone(),
+    )?;
+
+    msg_list.push(cosmos_msg);
+
+    let mut priv_exten = may_priv.clone().extension.unwrap();
+    priv_exten.claim_num = claim_itr;
+
+    let mut priv_store = PrefixedStorage::new(PREFIX_PRIV_META, &mut deps.storage);
+    may_priv.extension = Some(priv_exten);
+
+    save(&mut priv_store, &token_key, &may_priv)?;
+
+    Ok(HandleResponse {
+        messages: msg_list,
+        log: vec![
+            log("Last claim", &claim_start_str),
+            log("Ending claim", &claim_end_str),
+            log("Desired end claim", &claim_max_str),
+            log("token total", &claim_tokens_str),
+        ],
+        data: Some(to_binary(&HandleAnswer::ClaimTokens { status: Success })?),
+    })
 }
 
 /// Returns HandleResult
@@ -4368,6 +4552,8 @@ fn send_list<S: Storage, A: Api, Q: Querier>(
     sends: Option<Vec<Send>>,
 ) -> StdResult<Vec<CosmosMsg>> {
     let mut messages: Vec<CosmosMsg> = Vec::new();
+    // msg_list is for snip20 claiming
+    let mut msg_list: Vec<CosmosMsg> = vec![];
     let mut oper_for: Vec<CanonicalAddr> = Vec::new();
     let mut inv_updates: Vec<InventoryUpdate> = Vec::new();
     let num_perm_types = PermissionType::ViewOwner.num_types();
@@ -4380,12 +4566,71 @@ fn send_list<S: Storage, A: Api, Q: Querier>(
                     &env.block,
                     config,
                     sender,
-                    token_id,
+                    token_id.clone(),
                     recipient_raw.clone(),
                     &mut oper_for,
                     &mut inv_updates,
                     xfer.memo.clone(),
                 )?;
+
+                // Claim any unclaimed tokens
+                let (_token, idx) = get_token_if_permitted(
+                    deps,
+                    &env.block,
+                    &token_id,
+                    Some(sender),
+                    PermissionType::Transfer,
+                    &mut oper_for,
+                    config,
+                )?;
+
+                let token_key = idx.to_le_bytes();
+
+                let callback_code_hash: String = load(&deps.storage, CLAIM_SNIP_HASH_KEY)?;
+                let snip20_address: HumanAddr = load(&deps.storage, CLAIM_SNIP_ADDRESS_KEY)?;
+
+                let current_claim: u16 = load(&deps.storage, CURRENT_CLAIM)?;
+
+                let priv_store = ReadonlyPrefixedStorage::new(PREFIX_PRIV_META, &deps.storage);
+                let mut may_priv: Metadata =
+                    may_load(&priv_store, &token_key)?.unwrap_or(Metadata {
+                        token_uri: None,
+                        extension: None,
+                    });
+                let mut claim_itr = may_priv.clone().extension.unwrap().claim_num;
+
+                let claim_storage = ReadonlyPrefixedStorage::new(PREFIX_CLAIM_LIST, &deps.storage);
+
+                let padding = None;
+
+                let mut amount: u128 = 0;
+
+                while claim_itr < current_claim {
+                    claim_itr = claim_itr + 1;
+
+                    let this_claim: u128 = load(&claim_storage, &claim_itr.to_le_bytes())?;
+                    amount = amount + this_claim;
+                }
+
+                let recipient = deps.api.human_address(sender)?;
+                let cosmos_msg = transfer_msg(
+                    recipient,
+                    Uint128::from(amount),
+                    None,
+                    padding.clone(),
+                    BLOCK_SIZE,
+                    callback_code_hash.clone(),
+                    snip20_address.clone(),
+                )?;
+                msg_list.push(cosmos_msg);
+
+                let mut priv_exten = may_priv.clone().extension.unwrap();
+                priv_exten.claim_num = claim_itr;
+
+                let mut priv_store = PrefixedStorage::new(PREFIX_PRIV_META, &mut deps.storage);
+                may_priv.extension = Some(priv_exten);
+
+                save(&mut priv_store, &token_key, &may_priv)?;
             }
         }
     } else if let Some(snds) = sends {
@@ -4416,6 +4661,65 @@ fn send_list<S: Storage, A: Api, Q: Querier>(
                     };
                     send_from_list.push(new_sd_fm);
                 }
+
+                // Claim any unclaimed tokens
+                let (_token, idx) = get_token_if_permitted(
+                    deps,
+                    &env.block,
+                    &token_id,
+                    Some(sender),
+                    PermissionType::Transfer,
+                    &mut oper_for,
+                    config,
+                )?;
+
+                let token_key = idx.to_le_bytes();
+
+                let callback_code_hash: String = load(&deps.storage, CLAIM_SNIP_HASH_KEY)?;
+                let snip20_address: HumanAddr = load(&deps.storage, CLAIM_SNIP_ADDRESS_KEY)?;
+
+                let current_claim: u16 = load(&deps.storage, CURRENT_CLAIM)?;
+
+                let priv_store = ReadonlyPrefixedStorage::new(PREFIX_PRIV_META, &deps.storage);
+                let mut may_priv: Metadata =
+                    may_load(&priv_store, &token_key)?.unwrap_or(Metadata {
+                        token_uri: None,
+                        extension: None,
+                    });
+                let mut claim_itr = may_priv.clone().extension.unwrap().claim_num;
+
+                let claim_storage = ReadonlyPrefixedStorage::new(PREFIX_CLAIM_LIST, &deps.storage);
+
+                let padding = None;
+
+                let mut amount: u128 = 0;
+
+                while claim_itr < current_claim {
+                    claim_itr = claim_itr + 1;
+
+                    let this_claim: u128 = load(&claim_storage, &claim_itr.to_le_bytes())?;
+                    amount = amount + this_claim;
+                }
+
+                let recipient = deps.api.human_address(sender)?;
+                let cosmos_msg = transfer_msg(
+                    recipient,
+                    Uint128::from(amount),
+                    None,
+                    padding.clone(),
+                    BLOCK_SIZE,
+                    callback_code_hash.clone(),
+                    snip20_address.clone(),
+                )?;
+                msg_list.push(cosmos_msg);
+
+                let mut priv_exten = may_priv.clone().extension.unwrap();
+                priv_exten.claim_num = claim_itr;
+
+                let mut priv_store = PrefixedStorage::new(PREFIX_PRIV_META, &mut deps.storage);
+                may_priv.extension = Some(priv_exten);
+
+                save(&mut priv_store, &token_key, &may_priv)?;
             }
             // get BatchReceiveNft and ReceiveNft msgs for all the tokens sent in this Send
             messages.extend(receiver_callback_msgs(
